@@ -44,6 +44,13 @@
     Burst cycle : Device sends one burst per transmission cycle. All sensor data is
                   included in every packet (no channel multiplexing).
 
+    -- Error correction across burst repeats --
+    Each burst repeats the same 17-byte packet up to 8x (~120-130ms apart),
+    incrementing the 3-bit rolling counter (byte[1] low nibble) by one on
+    every repeat: 8 packets in one burst, counter running 0..7. All other
+    fields are constant across the burst. A single-repeat bit error gets
+    outvoted when enough repeats agree
+
 */
 
 #include "decoder.h"
@@ -83,6 +90,104 @@ static int nedis_check(uint8_t const *b)
     return 1;
 }
 
+/**
+ * Shared field extraction and output.
+ *
+ * @return 1 if data was successfully output, 0 on data_make() failure.
+ */
+static int nedis_output(r_device *decoder, uint8_t const *b)
+{
+    uint8_t counter    = b[1] & 0x0F;
+    uint32_t device_id = (b[2] << 16) | (b[3] << 8) | b[4];
+
+    int temp_raw = ((b[5] & 0x0F) << 8) | b[6];
+    if (temp_raw & 0x0800) {
+        temp_raw -= 0x1000;
+    }
+    float temp_c = temp_raw * 0.1f;
+
+    int humidity = b[7];
+
+    int wind_raw       = b[8] | ((b[9] & 0x0F) << 8);
+    float wind_avg_ms  = wind_raw * 2.0f;
+    float wind_avg_kmh = wind_avg_ms * 3.6f;
+
+    int dir_avg_idx        = (b[9] >> 4) & 0x0F;
+    float wind_avg_dir_deg = dir_avg_idx * 22.5f;
+
+    int gust_raw = b[10] | ((b[11] & 0x0F) << 8);
+    // Raw value is in 0.1 m/s.
+    float gust_ms  = gust_raw / 10.0f;
+    float gust_kmh = gust_ms * 3.6f;
+
+    int dir_gust_idx   = (b[11] >> 4) & 0x0F;
+    float wind_dir_deg = dir_gust_idx * 22.5f;
+
+    int rain_raw  = b[12] | (b[13] << 8);
+    float rain_mm = rain_raw * 0.35f;
+
+    data_t *data = data_make(
+            "model", "", DATA_STRING, "Nedis-WIFIWEST500WT",
+            "id", "Device ID", DATA_FORMAT, "%06X", DATA_INT, device_id,
+            "counter", "Counter", DATA_INT, counter,
+            "temperature_C", "Temperature", DATA_FORMAT, "%.1f C", DATA_DOUBLE, (double)temp_c,
+            "humidity", "Humidity", DATA_FORMAT, "%u %%", DATA_INT, humidity,
+            "wind_dir_deg", "Wind direction", DATA_FORMAT, "%.1f deg", DATA_DOUBLE, (double)wind_dir_deg,
+            "wind_dir_str", "Wind direction", DATA_STRING, nedis_wind_dir_str[dir_gust_idx],
+            "wind_avg_dir_deg", "Wind avg dir", DATA_FORMAT, "%.1f deg", DATA_DOUBLE, (double)wind_avg_dir_deg,
+            "wind_avg_m_s", "Wind speed (avg)", DATA_FORMAT, "%.1f m/s", DATA_DOUBLE, (double)wind_avg_ms,
+            "wind_avg_km_h", "Wind speed (avg)", DATA_FORMAT, "%.1f km/h", DATA_DOUBLE, (double)wind_avg_kmh,
+            "wind_max_m_s", "Wind gust", DATA_FORMAT, "%.1f m/s", DATA_DOUBLE, (double)gust_ms,
+            "wind_max_km_h", "Wind gust", DATA_FORMAT, "%.1f km/h", DATA_DOUBLE, (double)gust_kmh,
+            "rain_mm", "Rain total", DATA_FORMAT, "%.1f mm", DATA_DOUBLE, (double)rain_mm,
+            "mic", "Integrity", DATA_STRING, "CHECKSUM",
+            NULL);
+
+    if (!data) {
+        return 0;
+    }
+    decoder_output_data(decoder, data);
+    return 1;
+}
+
+/* ---- Cross-burst bit-majority voting ----
+ * The accumulator is explicitly reset after an up-to-8 repeats ~60s periodic
+ * burst is successfully validated and output (see decode_fn below).
+ */
+#define NEDIS_PACKET_BITS (17 * 8)
+
+static uint16_t nedis_vote_ones[NEDIS_PACKET_BITS];
+static int      nedis_vote_count = 0;
+static long     nedis_vote_key   = -1;
+
+static void nedis_vote_add(uint8_t const *b)
+{
+    long key = (b[2] << 16) | (b[3] << 8) | b[4];
+    if (key != nedis_vote_key) {
+        nedis_vote_key   = key;
+        nedis_vote_count = 0;
+        memset(nedis_vote_ones, 0, sizeof(nedis_vote_ones));
+    }
+    for (int i = 0; i < NEDIS_PACKET_BITS; i++) {
+        if ((b[i >> 3] >> (7 - (i & 7))) & 1) {
+            nedis_vote_ones[i]++;
+        }
+    }
+    nedis_vote_count++;
+}
+
+/** Per-bit majority of all repeats seen so far for the current key. Ties
+ *  (even vote count, exactly half-and-half) resolve to bit 0. */
+static void nedis_vote_result(uint8_t *out)
+{
+    memset(out, 0, 17);
+    for (int i = 0; i < NEDIS_PACKET_BITS; i++) {
+        if (nedis_vote_ones[i] * 2 > nedis_vote_count) {
+            out[i >> 3] |= 1 << (7 - (i & 7));
+        }
+    }
+}
+
 static int nedis_wifiwest500wt_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
     int row = bitbuffer_find_repeated_row(bitbuffer, 2, 17 * 8 * 7);
@@ -108,10 +213,10 @@ static int nedis_wifiwest500wt_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
     uint8_t decoded[17];
     int found  = 0;
-    int retval = DECODE_ABORT_LENGTH;
+    int retval = DECODE_FAIL_SANITY;
 
     // Scan for preamble end / data start
-    for (int chip = 0; chip + 952 < nchips; chip++) {
+    for (int chip = 0; chip + 952 <= nchips; chip++) {
         // Count preamble symbols (7 chips same polarity) before this point
         // A data symbol starts after at least 3 preamble symbols.
         // Try to decode 17 bytes starting from 'chip'.
@@ -148,61 +253,24 @@ static int nedis_wifiwest500wt_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         if (fail) {
             continue;
         }
-        if (!nedis_check(decoded)) {
+        // Require a plausible fixed header
+        // before treating this window as packet candidate
+        // (nedis_check() does the full validation)
+        if (decoded[0] != 0xF0) {
             continue;
         }
 
         found = 1;
 
-        uint8_t counter    = decoded[1] & 0x0F;
-        uint32_t device_id = (decoded[2] << 16) | (decoded[3] << 8) | decoded[4];
+        // Feed every cleanly PWM-decoded window into the cross-repeat vote,
+        // valid or not.
+        // A single-repeat bit error gets outvoted when enough repeats agree
+        nedis_vote_add(decoded);
 
-        int temp_raw = ((decoded[5] & 0x0F) << 8) | decoded[6];
-        if (temp_raw & 0x0800) {
-            temp_raw -= 0x1000;
-        }
-        float temp_c = temp_raw * 0.1f;
-
-        int humidity = decoded[7];
-
-        int wind_raw       = decoded[8] | ((decoded[9] & 0x0F) << 8);
-        float wind_avg_ms  = wind_raw * 2.0f;
-        float wind_avg_kmh = wind_avg_ms * 3.6f;
-
-        int dir_avg_idx        = (decoded[9] >> 4) & 0x0F;
-        float wind_avg_dir_deg = dir_avg_idx * 22.5f;
-
-        int gust_raw = decoded[10] | ((decoded[11] & 0x0F) << 8);
-        // Raw value is in 0.1 m/s.
-        float gust_ms  = gust_raw / 10.0f;
-        float gust_kmh = gust_ms * 3.6f;
-
-        int dir_gust_idx   = (decoded[11] >> 4) & 0x0F;
-        float wind_dir_deg = dir_gust_idx * 22.5f;
-
-        int rain_raw  = decoded[12] | (decoded[13] << 8);
-        float rain_mm = rain_raw * 0.35f;
-
-        data_t *data = data_make(
-                "model", "", DATA_STRING, "Nedis-WIFIWEST500WT",
-                "id", "Device ID", DATA_FORMAT, "%06X", DATA_INT, device_id,
-                "counter", "Counter", DATA_INT, counter,
-                "temperature_C", "Temperature", DATA_FORMAT, "%.1f C", DATA_DOUBLE, (double)temp_c,
-                "humidity", "Humidity", DATA_FORMAT, "%u %%", DATA_INT, humidity,
-                "wind_dir_deg", "Wind direction", DATA_FORMAT, "%.1f deg", DATA_DOUBLE, (double)wind_dir_deg,
-                "wind_dir_str", "Wind direction", DATA_STRING, nedis_wind_dir_str[dir_gust_idx],
-                "wind_avg_dir_deg", "Wind avg dir", DATA_FORMAT, "%.1f deg", DATA_DOUBLE, (double)wind_avg_dir_deg,
-                "wind_avg_m_s", "Wind speed (avg)", DATA_FORMAT, "%.1f m/s", DATA_DOUBLE, (double)wind_avg_ms,
-                "wind_avg_km_h", "Wind speed (avg)", DATA_FORMAT, "%.1f km/h", DATA_DOUBLE, (double)wind_avg_kmh,
-                "gust_m_s", "Wind gust", DATA_FORMAT, "%.1f m/s", DATA_DOUBLE, (double)gust_ms,
-                "gust_km_h", "Wind gust", DATA_FORMAT, "%.1f km/h", DATA_DOUBLE, (double)gust_kmh,
-                "rain_mm", "Rain total", DATA_FORMAT, "%.1f mm", DATA_DOUBLE, (double)rain_mm,
-                "mic", "Integrity", DATA_STRING, "CHECKSUM",
-                NULL);
-
-        if (data) {
-            decoder_output_data(decoder, data);
-            retval = 1;
+        uint8_t merged[17];
+        nedis_vote_result(merged);
+        if (nedis_check(merged) && nedis_output(decoder, merged)) {
+            nedis_vote_key = -1;
         }
 
         // Skip and continue (multiple packets in bitbuffer)
@@ -225,8 +293,8 @@ static char const *nedis_wifiwest500wt_output_fields[] = {
         "wind_avg_dir_deg",
         "wind_avg_m_s",
         "wind_avg_km_h",
-        "gust_m_s",
-        "gust_km_h",
+        "wind_max_m_s",
+        "wind_max_km_h",
         "rain_mm",
         "mic",
         NULL,
